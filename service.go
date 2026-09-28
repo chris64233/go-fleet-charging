@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
@@ -128,6 +129,8 @@ type PlanModification struct {
 	Departure    time.Time
 	MinEnergyUWh int64
 	MaxPowerW    int64
+	Priority     int32
+	FixedPower   bool
 }
 
 // ModifyPlan 在车辆抵达前原子修改计划：旧占用与新占用在同一次落库中替换，
@@ -142,6 +145,8 @@ func (s *Service) ModifyPlan(ctx context.Context, requestID string, mod PlanModi
 		Departure:    mod.Departure,
 		MinEnergyUWh: mod.MinEnergyUWh,
 		MaxPowerW:    mod.MaxPowerW,
+		Priority:     mod.Priority,
+		FixedPower:   mod.FixedPower,
 	}
 	if err := validateChargeRequest(newReq); err != nil {
 		return nil, err
@@ -183,6 +188,8 @@ func (s *Service) ModifyPlan(ctx context.Context, requestID string, mod PlanModi
 	candidate.Departure = newReq.Departure
 	candidate.MinEnergy = newReq.MinEnergyUWh
 	candidate.MaxPowerW = newReq.MaxPowerW
+	candidate.Priority = newReq.Priority
+	candidate.FixedPower = newReq.FixedPower
 
 	allocs, err := s.computeAllocationLocked(&candidate, now)
 	if err != nil {
@@ -196,6 +203,8 @@ func (s *Service) ModifyPlan(ctx context.Context, requestID string, mod PlanModi
 	plan.Departure = mod.Departure
 	plan.MinEnergy = mod.MinEnergyUWh
 	plan.MaxPowerW = mod.MaxPowerW
+	plan.Priority = mod.Priority
+	plan.FixedPower = mod.FixedPower
 	plan.Allocation = allocs
 	plan.Revision++
 	plan.UpdatedAt = now
@@ -242,6 +251,293 @@ func (s *Service) CancelPlan(ctx context.Context, requestID string) error {
 		return err
 	}
 	return nil
+}
+
+// PrepareCurtailment 针对一次站点可用功率临时下降事件生成一份可确认的调整方案。
+// 生成过程只读状态、不改任何数据：
+//   - 固定功率预约与已抵达（arrived）预约的占用完全保留，不参与削减；
+//   - 其余有效（active）预约先按最早离开优先（EDF）保证每笔的窗口内最低所需电量，
+//     任一预约的最低需求无法满足时返回 KindCapacity，不出方案；
+//   - 保底后仍有富余容量时，按优先级从高到低把功率补回原安排（不超过原占用）。
+//
+// 事件窗口之外的预约分配不受影响。方案内记录了所有相关预约的版本指纹，
+// 供 ConfirmCurtailment 做乐观并发校验。
+func (s *Service) PrepareCurtailment(ctx context.Context, ev CurtailmentEvent) (*CurtailmentPlan, error) {
+	if err := validateCurtailmentEvent(ev); err != nil {
+		return nil, err
+	}
+	s.lock()
+	defer s.unlock()
+	now := s.now()
+	if s.advanceLocked(now) {
+		if err := s.persistLocked(ctx, "PrepareCurtailment:advance"); err != nil {
+			return nil, err
+		}
+	}
+
+	cfg, ok := s.snap.Stations[ev.StationID]
+	if !ok {
+		return nil, fail(KindParameter, "PrepareCurtailment", "站点 %q 未配置", ev.StationID)
+	}
+
+	// 可调整预约：与事件窗口正长度相交、且未抵达、未声明固定功率的 active 预约。
+	var adjustable []*Plan
+	for _, p := range s.snap.Plans {
+		if p.StationID != ev.StationID || p.Status != StatusActive || p.FixedPower {
+			continue
+		}
+		if intervalOverlaps(p.Arrival, p.Departure, ev.Start, ev.End) {
+			adjustable = append(adjustable, p)
+		}
+	}
+
+	// 重排范围至少覆盖整个事件窗口，并向外延伸到可调整预约的在场并集，
+	// 这样被挤出窗口的功率才有地方可去，窗口内的固定占用也不会被漏算。
+	scopeLo, scopeHi := ev.Start, ev.End
+	for _, p := range adjustable {
+		if p.Arrival.Before(scopeLo) {
+			scopeLo = p.Arrival
+		}
+		if p.Departure.After(scopeHi) {
+			scopeHi = p.Departure
+		}
+	}
+
+	// 其余与重排范围相交的有效预约（固定/已抵达，以及只落在外溢时段的第三方预约）
+	// 占用一律视为不可移动的障碍物。
+	adjSet := make(map[string]bool, len(adjustable))
+	for _, p := range adjustable {
+		adjSet[p.RequestID] = true
+	}
+	var blockers []*Plan
+	for _, p := range s.snap.Plans {
+		if p.StationID != ev.StationID || p.Status == StatusCancelled || adjSet[p.RequestID] {
+			continue
+		}
+		if intervalOverlaps(p.Arrival, p.Departure, scopeLo, scopeHi) {
+			blockers = append(blockers, p)
+		}
+	}
+
+	// 受保护（不可移动）占用在任一时间片超出降容后容量 → 无法成案。
+	effective := applyEventToSegments(cfg.Segments, ev)
+	ps := buildCurtailPieces(effective, scopeLo, scopeHi, ev.Start, ev.End, blockers, adjustable)
+	for i := range ps {
+		if ps[i].protected > ps[i].capacity {
+			return nil, fail(KindCapacity, "PrepareCurtailment",
+				"站点 %s 在 [%s,%s) 降容至 %dW，仍低于不可移动（固定/已抵达）占用 %dW，无法在不削减固定预约的前提下成案",
+				ev.StationID, ps[i].start.Format(time.RFC3339Nano),
+				ps[i].end.Format(time.RFC3339Nano), ps[i].capacity, ps[i].protected)
+		}
+	}
+
+	// 每笔可调整预约的目标是“全程”最低功量；origByPiece 给出其在每个时间片上的原占用。
+	metas := make([]*adjMeta, 0, len(adjustable))
+	for _, p := range adjustable {
+		required := Mul128(p.MinEnergy, nanoWorkPerMicroWh)
+		orig := make([]int64, len(ps))
+		for j := range ps {
+			if intervalOverlaps(p.Arrival, p.Departure, ps[j].start, ps[j].end) {
+				for k := range p.Allocation {
+					a := &p.Allocation[k]
+					if (!ps[j].start.Before(a.Start)) && ps[j].start.Before(a.End) {
+						orig[j] = a.PowerW
+						break
+					}
+				}
+			}
+		}
+		metas = append(metas, &adjMeta{plan: p, required: required, origByPiece: orig})
+	}
+
+	newByID, feasible := reallocateCurtailment(ps, metas)
+	if !feasible {
+		return nil, fail(KindCapacity, "PrepareCurtailment",
+			"站点 %s 在 [%s,%s) 降至 %dW 后，无法把可调整预约全部转移并满足其最低充电需求",
+			ev.StationID, ev.Start.Format(time.RFC3339Nano), ev.End.Format(time.RFC3339Nano), ev.PowerW)
+	}
+
+	// 组装确定性的调整明细（仅可调整预约，携带完整新旧分配）。
+	ids := make([]string, 0, len(adjustable))
+	for _, p := range adjustable {
+		ids = append(ids, p.RequestID)
+	}
+	sort.Strings(ids)
+	curtPlan := &CurtailmentPlan{Event: ev}
+	for _, id := range ids {
+		p := s.snap.Plans[id]
+		curtPlan.Adjustments = append(curtPlan.Adjustments, Adjustment{
+			RequestID:     id,
+			Revision:      p.Revision,
+			Priority:      p.Priority,
+			FixedPower:    p.FixedPower,
+			OldAllocation: append([]SlotAllocation(nil), p.Allocation...),
+			NewAllocation: newByID[id],
+		})
+	}
+
+	// 版本指纹覆盖重排范围内的全部有效预约（可调整 + 障碍物），
+	// 任一笔被改/取消，或范围集合增减，确认时都会被拒绝。
+	fingerprintIDs := make([]string, 0, len(adjustable)+len(blockers))
+	fingerprintIDs = append(fingerprintIDs, ids...)
+	for _, p := range blockers {
+		fingerprintIDs = append(fingerprintIDs, p.RequestID)
+	}
+	sort.Strings(fingerprintIDs)
+	versions := make([]planVersion, 0, len(fingerprintIDs))
+	for _, id := range fingerprintIDs {
+		p := s.snap.Plans[id]
+		versions = append(versions, planVersion{requestID: id, revision: p.Revision, status: p.Status})
+	}
+	curtPlan.stationHash = hashStationConfig(cfg)
+	curtPlan.versions = versions
+	curtPlan.scopeStart = scopeLo
+	curtPlan.scopeEnd = scopeHi
+	return curtPlan, nil
+}
+
+// ConfirmCurtailment 确认一份削减方案：在同一事务（单次原子落库）中更新站点时段
+// 容量与所有受影响预约。确认前逐笔复核版本指纹——方案生成后任何一笔预约被修改、
+// 取消，或窗口内出现/消失了预约，或站点容量被重新配置，整份方案即以 KindConflict
+// 失败并保持原安排不变，绝不会只改其中一部分。
+func (s *Service) ConfirmCurtailment(ctx context.Context, plan *CurtailmentPlan) ([]*Plan, error) {
+	if plan == nil {
+		return nil, fail(KindParameter, "ConfirmCurtailment", "方案不能为空")
+	}
+	ev := plan.Event
+	if err := validateCurtailmentEventOp(ev, "ConfirmCurtailment"); err != nil {
+		return nil, err
+	}
+	s.lock()
+	defer s.unlock()
+	now := s.now()
+	if s.advanceLocked(now) {
+		if err := s.persistLocked(ctx, "ConfirmCurtailment:advance"); err != nil {
+			return nil, err
+		}
+	}
+
+	cfg, ok := s.snap.Stations[ev.StationID]
+	if !ok {
+		return nil, fail(KindParameter, "ConfirmCurtailment", "站点 %q 未配置", ev.StationID)
+	}
+	if hashStationConfig(cfg) != plan.stationHash {
+		return nil, fail(KindConflict, "ConfirmCurtailment",
+			"站点 %s 的容量配置在方案生成后已变化，旧方案失效", ev.StationID)
+	}
+
+	// 复核版本指纹：每笔预约必须仍在、状态与版本一致。
+	versionSet := make(map[string]planVersion, len(plan.versions))
+	for _, v := range plan.versions {
+		versionSet[v.requestID] = v
+	}
+	for _, v := range plan.versions {
+		cur, ok := s.snap.Plans[v.requestID]
+		if !ok {
+			return nil, fail(KindConflict, "ConfirmCurtailment",
+				"预约 %q 在方案生成后已不存在，旧方案失效", v.requestID)
+		}
+		if cur.Revision != v.revision || cur.Status != v.status {
+			return nil, fail(KindConflict, "ConfirmCurtailment",
+				"预约 %q 在方案生成后已被修改或取消（版本 %d→%d），旧方案失效",
+				v.requestID, v.revision, cur.Revision)
+		}
+	}
+
+	// 复核重排范围内预约集合：新增/消失的有效预约都会改变容量归属，拒绝旧方案。
+	for _, p := range s.snap.Plans {
+		if p.StationID != ev.StationID || p.Status == StatusCancelled {
+			continue
+		}
+		if !intervalOverlaps(p.Arrival, p.Departure, plan.scopeStart, plan.scopeEnd) {
+			continue
+		}
+		if _, seen := versionSet[p.RequestID]; !seen {
+			return nil, fail(KindConflict, "ConfirmCurtailment",
+				"重排范围内出现方案生成时不在场的预约 %q，旧方案失效", p.RequestID)
+		}
+	}
+
+	effective := applyEventToSegments(cfg.Segments, ev)
+
+	adjByID := make(map[string]Adjustment, len(plan.Adjustments))
+	for _, a := range plan.Adjustments {
+		adjByID[a.RequestID] = a
+	}
+
+	// 构造范围内每个有效预约的目标分配：可调整预约整体替换为方案给出的新分配，
+	// 其余预约（固定/已抵达/第三方）保持原分配。
+	targetAlloc := make(map[string][]SlotAllocation)
+	for _, p := range s.snap.Plans {
+		if p.StationID != ev.StationID || p.Status == StatusCancelled {
+			continue
+		}
+		if !intervalOverlaps(p.Arrival, p.Departure, plan.scopeStart, plan.scopeEnd) {
+			continue
+		}
+		if a, ok := adjByID[p.RequestID]; ok {
+			targetAlloc[p.RequestID] = a.NewAllocation
+		} else {
+			targetAlloc[p.RequestID] = p.Allocation
+		}
+	}
+
+	// 统一校验：逐最细时间片确认 ① 调整后总占用 ≤ 降容后容量；
+	// ② 事件窗口内总占用只减不增（容量守恒）；③ 每笔预约全程能量 ≥ 最低需求。
+	curPlans := make(map[string]*Plan, len(targetAlloc))
+	originals := make(map[string][]SlotAllocation, len(targetAlloc))
+	for reqID := range targetAlloc {
+		p := s.snap.Plans[reqID]
+		curPlans[reqID] = p
+		originals[reqID] = p.Allocation
+	}
+	if err := verifyCurtailment(cfg.Segments, effective, ev, plan.scopeStart, plan.scopeEnd, curPlans, originals, targetAlloc); err != nil {
+		return nil, err
+	}
+
+	// 生成待提交列表（仅真正变化的预约）。
+	type pending struct {
+		plan     *Plan
+		old      Plan
+		newAlloc []SlotAllocation
+	}
+	pendings := make([]pending, 0, len(plan.versions))
+	affected := make(map[string]bool, len(plan.versions))
+	for reqID, alloc := range targetAlloc {
+		p := s.snap.Plans[reqID]
+		if allocationsEqual(alloc, p.Allocation) {
+			continue
+		}
+		pendings = append(pendings, pending{plan: p, old: *p, newAlloc: alloc})
+		affected[reqID] = true
+	}
+
+	// 应用：站点容量 + 所有受影响预约，单次原子落库。
+	cfgCopy := StationConfig{StationID: cfg.StationID, Segments: effective}
+	s.snap.Stations[ev.StationID] = cfgCopy
+	for _, pd := range pendings {
+		pd.plan.Allocation = pd.newAlloc
+		pd.plan.Revision++
+		pd.plan.UpdatedAt = now
+	}
+	if err := s.persistLocked(ctx, "ConfirmCurtailment"); err != nil {
+		// 回滚内存态：配置与每笔预约恢复原样。
+		s.snap.Stations[ev.StationID] = cfg
+		for _, pd := range pendings {
+			*pd.plan = pd.old
+		}
+		return nil, err
+	}
+
+	out := make([]*Plan, 0, len(pendings))
+	for _, v := range plan.versions {
+		if !affected[v.requestID] {
+			continue
+		}
+		cp := *s.snap.Plans[v.requestID]
+		out = append(out, &cp)
+	}
+	return out, nil
 }
 
 // GetPlan 按外部请求号查询计划；不存在返回 KindState。
@@ -341,18 +637,20 @@ func (s *Service) checkWindowLocked(stationID string, from, to time.Time) error 
 // buildPlanLocked 校验容量可行性并构造尚未入库的计划。
 func (s *Service) buildPlanLocked(req ChargeRequest, now time.Time) (*Plan, error) {
 	plan := &Plan{
-		ID:        s.nextIDLocked(),
-		RequestID: req.RequestID,
-		StationID: req.StationID,
-		VehicleID: req.VehicleID,
-		Arrival:   req.Arrival,
-		Departure: req.Departure,
-		MinEnergy: req.MinEnergyUWh,
-		MaxPowerW: req.MaxPowerW,
-		Status:    StatusActive,
-		CreatedAt: now,
-		UpdatedAt: now,
-		Revision:  1,
+		ID:         s.nextIDLocked(),
+		RequestID:  req.RequestID,
+		StationID:  req.StationID,
+		VehicleID:  req.VehicleID,
+		Arrival:    req.Arrival,
+		Departure:  req.Departure,
+		MinEnergy:  req.MinEnergyUWh,
+		MaxPowerW:  req.MaxPowerW,
+		Priority:   req.Priority,
+		FixedPower: req.FixedPower,
+		Status:     StatusActive,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+		Revision:   1,
 	}
 	allocs, err := s.computeAllocationLocked(plan, now)
 	if err != nil {
@@ -406,7 +704,9 @@ func sameRequestContent(p *Plan, req ChargeRequest) bool {
 		p.Arrival.Equal(req.Arrival) &&
 		p.Departure.Equal(req.Departure) &&
 		p.MinEnergy == req.MinEnergyUWh &&
-		p.MaxPowerW == req.MaxPowerW
+		p.MaxPowerW == req.MaxPowerW &&
+		p.Priority == req.Priority &&
+		p.FixedPower == req.FixedPower
 }
 
 // checkPlansFitConfig 判断新配置下所有有效计划是否仍满足逐片容量约束。
@@ -475,6 +775,26 @@ func validateStationConfig(cfg StationConfig) error {
 				return fail(KindParameter, op, "时段必须按起点升序排列")
 			}
 		}
+	}
+	return nil
+}
+
+func validateCurtailmentEvent(ev CurtailmentEvent) error {
+	return validateCurtailmentEventOp(ev, "PrepareCurtailment")
+}
+
+func validateCurtailmentEventOp(ev CurtailmentEvent, op string) error {
+	if ev.StationID == "" {
+		return fail(KindParameter, op, "station_id 不能为空")
+	}
+	if ev.Start.IsZero() || ev.End.IsZero() {
+		return fail(KindTime, op, "影响时段 start/end 不能为空")
+	}
+	if !ev.Start.Before(ev.End) {
+		return fail(KindTime, op, "影响时段起点必须早于终点")
+	}
+	if ev.PowerW < 0 {
+		return fail(KindParameter, op, "降容功率不能为负")
 	}
 	return nil
 }

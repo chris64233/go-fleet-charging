@@ -20,6 +20,9 @@ const (
 	KindState ErrorKind = "state"
 	// KindIdempotency 幂等冲突：同一外部请求号对应了不同的请求内容。
 	KindIdempotency ErrorKind = "idempotency"
+	// KindConflict 乐观并发冲突：削减方案生成后，相关预约版本或站点容量已变化，
+	// 旧方案过期，必须重新生成；整份方案未做任何修改。
+	KindConflict ErrorKind = "conflict"
 )
 
 // Error 是服务对外返回的统一错误类型，用 Kind 区分类别，Op 记录发生位置。
@@ -63,6 +66,7 @@ var (
 	ErrTime       = &Error{Kind: KindTime}
 	ErrState      = &Error{Kind: KindState}
 	ErrIdempotent = &Error{Kind: KindIdempotency}
+	ErrConflict   = &Error{Kind: KindConflict}
 )
 
 // KindOf 返回错误类别；非本服务错误返回空字符串。

@@ -14,7 +14,7 @@ import (
 // snapshot 是服务的全部持久化状态。
 type snapshot struct {
 	Stations map[string]StationConfig `json:"stations"`
-	Plans    map[string]*Plan         `json:"plans"`
+	Plans    map[string]*Plan         `json:"plans"` // key: RequestID
 	Counter  int64                    `json:"counter"`
 }
 

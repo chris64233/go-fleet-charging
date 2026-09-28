@@ -30,6 +30,8 @@ type Segment struct {
 //   - MinEnergyUWh: 离开前必须充到的最低电量，单位微瓦时（µWh，1 Wh = 1e6 µWh）
 //   - MaxPowerW: 单车每时段可接受的最大功率（瓦）
 //   - RequestID: 外部请求号，用于幂等
+//   - Priority: 容量紧张时的保留优先级，数值越大越优先；降容调整只削减低优先级预约
+//   - Fixed: 固定功率预约，任何时段的分配功率都不允许被降容方案削减
 type ChargeRequest struct {
 	RequestID    string    `json:"request_id"`
 	StationID    string    `json:"station_id"`
@@ -38,6 +40,8 @@ type ChargeRequest struct {
 	Departure    time.Time `json:"departure"`
 	MinEnergyUWh int64     `json:"min_energy_uwh"`
 	MaxPowerW    int64     `json:"max_power_w"`
+	Priority     int       `json:"priority"`
+	Fixed        bool      `json:"fixed"`
 }
 
 // PlanStatus 计划生命周期状态。
@@ -63,11 +67,55 @@ type Plan struct {
 	Departure  time.Time        `json:"departure"`
 	MinEnergy  int64            `json:"min_energy_uwh"`
 	MaxPowerW  int64            `json:"max_power_w"`
+	Priority   int              `json:"priority"`
+	Fixed      bool             `json:"fixed"`
 	Allocation []SlotAllocation `json:"allocation"`
 	Status     PlanStatus       `json:"status"`
 	CreatedAt  time.Time        `json:"created_at"`
 	UpdatedAt  time.Time        `json:"updated_at"`
 	Revision   int              `json:"revision"`
+}
+
+// CapacityEvent 描述站点可用功率的临时下降（降容事件）。
+// 半开时段 [Start, End) 内站点可用功率被覆盖为 PowerW，事件结束后恢复原配置；
+// EventID 是外部事件号（仅用于追踪，不参与去重；同一事件可多次准备，各得独立方案）。
+// PowerW 必须低于事件所覆盖时段的原容量，否则不属于“容量下降”，返回 KindParameter。
+type CapacityEvent struct {
+	EventID   string    `json:"event_id"`
+	StationID string    `json:"station_id"`
+	Start     time.Time `json:"start"`
+	End       time.Time `json:"end"`
+	PowerW    int64     `json:"power_w"`
+}
+
+// AdjustmentItem 是降容方案中一笔预约的调整明细（覆盖其完整在场窗口）。
+// FromRevision 是方案生成时该预约的版本号；确认时必须仍与此一致，否则方案过期。
+// 固定预约与无需变动的预约也会出现在方案中，Allocation 与当前分配相同，
+// 仅作为版本守卫——它们在确认前若被修改/取消，整份方案同样失败。
+type AdjustmentItem struct {
+	RequestID    string
+	Priority     int
+	Fixed        bool
+	FromRevision int
+	Allocation   []SlotAllocation // 调整后完整分配（含事件窗口之外不变的部分）
+}
+
+// CurtailmentPlan 是一份待确认的降容调整方案。
+// 方案只在内存中持有、不入库；ConfirmToken 用于防止同一方案被重复确认。
+type CurtailmentPlan struct {
+	Token     string
+	Event     CapacityEvent
+	Segments  []Segment        // 应用事件后的站点完整时段配置
+	Items     []AdjustmentItem // 受事件影响、需要随容量一起更新的预约
+	CreatedAt time.Time
+}
+
+// 方案状态摘要行，便于调用方在确认后核对每笔预约的落实结果。
+type AdjustmentResult struct {
+	RequestID    string
+	FromRevision int
+	ToRevision   int
+	Allocation   []SlotAllocation
 }
 
 // SlotAllocation 是计划在站点某段时间上的功率分配（半开区间，边界与配置时段对齐）。

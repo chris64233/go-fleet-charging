@@ -16,10 +16,11 @@ type Clock func() time.Time
 // 所有公开方法都在同一把互斥锁内完成“检查 + 落库”，
 // 因此并发提交/修改/取消之间天然串行化，不会出现部分占用或重复释放。
 type Service struct {
-	mu    sync.Mutex
-	store Store
-	now   Clock
-	snap  *snapshot
+	mu      sync.Mutex
+	store   Store
+	now     Clock
+	snap    *snapshot
+	pending map[string]*pendingCurtailment // 待确认降容方案，key: token
 }
 
 func (s *Service) lock()   { s.mu.Lock() }
@@ -35,7 +36,7 @@ func WithClock(c Clock) Option {
 
 // NewService 从 store 装载持久化数据并返回服务。store 中数据损坏时返回错误。
 func NewService(store Store, opts ...Option) (*Service, error) {
-	s := &Service{store: store, now: time.Now}
+	s := &Service{store: store, now: time.Now, pending: map[string]*pendingCurtailment{}}
 	for _, o := range opts {
 		o(s)
 	}
@@ -128,11 +129,14 @@ type PlanModification struct {
 	Departure    time.Time
 	MinEnergyUWh int64
 	MaxPowerW    int64
+	Priority     int
+	Fixed        bool
 }
 
 // ModifyPlan 在车辆抵达前原子修改计划：旧占用与新占用在同一次落库中替换，
 // 容量不可行或车辆已抵达都会整体失败，旧计划保持不变。
-// requestID 为提交时使用的外部请求号。
+// requestID 为提交时使用的外部请求号。修改成功后预约版本号（Revision）加一，
+// 任何引用旧版本的待确认降容方案将在确认时被拒绝。
 func (s *Service) ModifyPlan(ctx context.Context, requestID string, mod PlanModification) (*Plan, error) {
 	newReq := ChargeRequest{
 		RequestID:    requestID,
@@ -142,6 +146,8 @@ func (s *Service) ModifyPlan(ctx context.Context, requestID string, mod PlanModi
 		Departure:    mod.Departure,
 		MinEnergyUWh: mod.MinEnergyUWh,
 		MaxPowerW:    mod.MaxPowerW,
+		Priority:     mod.Priority,
+		Fixed:        mod.Fixed,
 	}
 	if err := validateChargeRequest(newReq); err != nil {
 		return nil, err
@@ -183,6 +189,8 @@ func (s *Service) ModifyPlan(ctx context.Context, requestID string, mod PlanModi
 	candidate.Departure = newReq.Departure
 	candidate.MinEnergy = newReq.MinEnergyUWh
 	candidate.MaxPowerW = newReq.MaxPowerW
+	candidate.Priority = newReq.Priority
+	candidate.Fixed = newReq.Fixed
 
 	allocs, err := s.computeAllocationLocked(&candidate, now)
 	if err != nil {
@@ -196,6 +204,8 @@ func (s *Service) ModifyPlan(ctx context.Context, requestID string, mod PlanModi
 	plan.Departure = mod.Departure
 	plan.MinEnergy = mod.MinEnergyUWh
 	plan.MaxPowerW = mod.MaxPowerW
+	plan.Priority = mod.Priority
+	plan.Fixed = mod.Fixed
 	plan.Allocation = allocs
 	plan.Revision++
 	plan.UpdatedAt = now
@@ -349,6 +359,8 @@ func (s *Service) buildPlanLocked(req ChargeRequest, now time.Time) (*Plan, erro
 		Departure: req.Departure,
 		MinEnergy: req.MinEnergyUWh,
 		MaxPowerW: req.MaxPowerW,
+		Priority:  req.Priority,
+		Fixed:     req.Fixed,
 		Status:    StatusActive,
 		CreatedAt: now,
 		UpdatedAt: now,
@@ -406,7 +418,9 @@ func sameRequestContent(p *Plan, req ChargeRequest) bool {
 		p.Arrival.Equal(req.Arrival) &&
 		p.Departure.Equal(req.Departure) &&
 		p.MinEnergy == req.MinEnergyUWh &&
-		p.MaxPowerW == req.MaxPowerW
+		p.MaxPowerW == req.MaxPowerW &&
+		p.Priority == req.Priority &&
+		p.Fixed == req.Fixed
 }
 
 // checkPlansFitConfig 判断新配置下所有有效计划是否仍满足逐片容量约束。
